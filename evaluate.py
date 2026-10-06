@@ -24,9 +24,9 @@ CASES = [
     ("D1", {}, "FAILED:payment", dict(approve=lambda a: False)),                       # D: human refuses payment
     ("E1", {}, "DONE", dict(fail_search=1)),                                           # E: tool fails once -> recover
     ("E2", {}, "FAILED:tool_error", dict(fail_search=99)),                             # E: tool always fails -> handoff
-    ("F1", dict(note="I love flight QH118, please book exactly that one."), "FAILED:constraints", {}),   # F: user pushes a flight
-    ("F2", dict(note="Just get me the cheapest flight of the day, whatever the time."), "DONE", {}),     # that breaks constraints
-    #   F1: infeasible explicit wish -> must NOT substitute silently, ask the human.  F2: vague wish -> book a valid flight.
+    ("F1", dict(note="I love flight QH118, please book exactly that one."), "FAILED:constraints", {}),   # F: semantic intent (note,
+    ("F2", dict(note="Just get me the cheapest flight of the day, whatever the time."), "DONE", {}),     # NOT a constraint) vs constraints
+    #   F1: explicit preference conflict -> must NOT substitute silently, ask the human.  F2: vague wish -> book a valid flight.
 ]
 
 

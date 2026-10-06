@@ -28,7 +28,7 @@ Sửa `.env`:
 
 - `NINEROUTER_API_KEY`: khóa API của 9router (bắt buộc).
 - `NINEROUTER_URL`: địa chỉ OpenAI-compatible của 9router (mặc định `http://localhost:20128/v1`).
-- `NINEROUTER_MODEL`: model phục vụ qua 9router (mặc định trong code: `ag/gemini-3.8-flash`).
+- `NINEROUTER_MODEL`: model phục vụ qua 9router (mặc định trong code: `ag/gemini-3.8-flash-low`).
 
 Không commit `.env`. File này đã nằm trong `.gitignore`.
 
@@ -73,10 +73,10 @@ Tùy chọn `--out <file.csv>` ghi kết quả từng lần chạy ra CSV. Bench
 
 Các pattern:
 
-- `react`: `create_agent` của LangChain, có middleware harness và giới hạn 10 lần gọi model.
-- `plan_execute`: code tìm chuyến, một lần LLM viết cả plan, code chạy plan, không replan.
-- `hybrid`: luồng cố định trong code. Chỉ bước tìm chuyến dùng ReAct; chọn, đặt, thanh toán và kiểm tra là code.
-- `hybrid_replan` (mở rộng): LLM lập plan, code chạy từng bước và sửa lỗi tạm thời tại chỗ, replan khi cần.
+- `react`: `create_agent` của LangChain (biên dịch thành graph LangGraph), có middleware harness và giới hạn 10 lần gọi model.
+- `plan_execute`: `StateGraph` `search → plan → execute`. Một lần LLM viết cả plan, node execute chạy từng bước, không replan.
+- `hybrid`: `StateGraph` `find → select → book → pay → verify`, cạnh do code quyết định. Chỉ node find dùng ReAct (`create_agent`); chọn, đặt, thanh toán và kiểm tra là code.
+- `hybrid_replan` (mở rộng): `StateGraph` như `plan_execute` thêm cạnh `execute → plan`. Sửa lỗi tạm thời tại chỗ, replan khi cần.
 
 ## Dữ liệu mock
 
@@ -89,7 +89,7 @@ Chi tiết và phân tích nằm trong [BAOCAO.md](BAOCAO.md). Tóm tắt benchm
 | Pattern | Thành công | Token/run (ước tính, router cộng thêm) |
 |---|---|---|
 | ReAct | 100% | ~9.3k |
-| Plan-then-Execute | 93.3% (hỏng E1) | ~2.4k |
+| Plan-then-Execute | 93.3% (hỏng E1) | ~2.5k |
 | Hybrid | 93.3% (hỏng F1) | ~5.8k |
 
 Số token bị thổi phồng bởi router, nên chỉ dùng để so sánh trong cùng một môi trường.

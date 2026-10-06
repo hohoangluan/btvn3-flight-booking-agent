@@ -9,11 +9,11 @@ Harness (plain Python, the model cannot skip it):
     4. Handoff to a human       -> handoff(), when the agent fails
     + loop guard (same call 3x) and "empty result = error" (from flight_agent_failure_mode.py)
 
-Patterns (same model, tools, harness):
+Patterns (same model, tools, harness; all four run as LangGraph graphs):
     react         the model decides ONE step at a time (LangChain create_agent)
-    plan_execute  the model writes the WHOLE plan once, then code runs it - no replanning
-    hybrid        fixed plan in code: find (ReAct) -> select (code) -> book -> pay -> verify (code)
-    hybrid_replan LLM plans -> code runs + observes each step: an error is fixed in place (retry), else replan (max 2)
+    plan_execute  StateGraph: the model writes the WHOLE plan once, then code runs it - no replanning
+    hybrid        StateGraph, fixed flow: find (create_agent) -> select (code) -> book -> pay -> verify (code)
+    hybrid_replan StateGraph: LLM plans -> code runs + observes each step: an error is fixed in place (retry), else replan (max 2)
 
 LLM = 9router, set in .env: NINEROUTER_API_KEY, NINEROUTER_URL, NINEROUTER_MODEL
 Run:  python flight_agent.py [react|plan_execute|hybrid|hybrid_replan]
@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from typing import TypedDict
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -31,6 +32,7 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 load_dotenv()
@@ -206,7 +208,37 @@ def react(model, cfg):
     agent.invoke(ask(), cfg)
 
 
-# ---- 2. Plan-then-Execute: ONE model call writes the whole plan, then plain code runs it
+# ---- 2/3/4 are LangGraph StateGraphs: each step is a NODE, code decides the EDGES (react's create_agent is a graph too)
+class State(TypedDict, total=False):
+    flights: list | None   # search result (None = the search failed)
+    steps: list            # plan steps still to run
+    plans: int             # plans written so far (hybrid_replan)
+    failed: bool           # did the last step fail? (hybrid_replan)
+    tries: int             # finder invocations (hybrid)
+    flight: str | None     # selected flight (hybrid)
+    code: str | None       # booking code (hybrid)
+    done: bool             # is_done() at the end (hybrid)
+
+
+def args_of(step) -> dict:
+    """Plan step -> tool args; "$booking_code" is filled in from the last successful book_seat."""
+    code = next((r["code"] for t, _, r in reversed(LOG) if t == "book_seat" and r["status"] == "ok"), "")
+    return {k: v for k, v in (("flight", step.flight), ("code", code if step.code == "$booking_code" else step.code)) if v}
+
+
+def build(nodes: dict, edges: dict):
+    """Compile a StateGraph. The first node is the entry; edges[node] = next node name, or a function state -> name."""
+    g = StateGraph(State)
+    for name, fn in nodes.items():
+        g.add_node(name, fn)
+    g.add_edge(START, next(iter(nodes)))
+    for name, nxt in edges.items():
+        g.add_conditional_edges(name, nxt) if callable(nxt) else g.add_edge(name, nxt)
+    return g.compile()
+
+
+# ---- 2. Plan-then-Execute: ONE model call writes the whole plan, then code runs it
+#         graph: search -> plan (LLM, once) -> execute (loops over the steps) -> END. No edge back to plan.
 class Step(BaseModel):
     tool: str          # one of: book_seat, pay, get_booking
     flight: str = ""   # for book_seat, e.g. "VN122"
@@ -227,39 +259,67 @@ PLANNER = ChatPromptTemplate.from_messages([
 
 
 def plan_execute(model, cfg):
-    found = guarded("search_flights", dict(origin=C.origin, destination=C.destination, date=C.date))
-    if found["status"] != "ok":
-        return                                              # no flight list -> cannot plan
-    plan = (PLANNER | model.with_structured_output(Plan, method="function_calling")).invoke(
-        {"goal": C.to_prompt(), "flights": json.dumps(found["flights"]), "so_far": "nothing yet"}, cfg)
-    for step in plan.steps:                                 # EXECUTE: no model call from here on
-        code = next((r["code"] for t, _, r in reversed(LOG) if t == "book_seat" and r["status"] == "ok"), "")
-        args = {k: v for k, v in (("flight", step.flight), ("code", code if step.code == "$booking_code" else step.code)) if v}
-        if guarded(step.tool, args)["status"] != "ok":
-            break                                           # the plan cannot adapt -> stop
+    planner = PLANNER | model.with_structured_output(Plan, method="function_calling")
+
+    def search(state):
+        return {"flights": guarded("search_flights", dict(origin=C.origin, destination=C.destination, date=C.date)).get("flights")}
+
+    def plan(state, config):
+        p = planner.invoke({"goal": C.to_prompt(), "flights": json.dumps(state["flights"]), "so_far": "nothing yet"}, config)
+        return {"steps": p.steps}
+
+    def execute(state):                                     # one step, no model call
+        ok = guarded(state["steps"][0].tool, args_of(state["steps"][0]))["status"] == "ok"
+        return {"steps": state["steps"][1:] if ok else []}  # the plan cannot adapt -> stop
+
+    build({"search": search, "plan": plan, "execute": execute}, {
+        "search": lambda s: "plan" if s["flights"] is not None else END,    # no flight list -> cannot plan
+        "plan": lambda s: "execute" if s["steps"] else END,
+        "execute": lambda s: "execute" if s["steps"] else END,
+    }).invoke({}, cfg)
 
 
-# ---- 3. Hybrid: fixed plan in code. Only "find" is ReAct; select/book/pay/verify are code.
+# ---- 3. Hybrid: fixed flow in code. Only "find" is ReAct (a create_agent graph inside a node); the rest is code.
+#         graph: find (max 2 tries) -> select -> book -> pay -> verify -> END
 def hybrid(model, cfg):
     finder = create_agent(model=model, tools=[search_flights], middleware=[harness, limit()],
                           system_prompt="Find flights for the request with search_flights. If it errors, retry. "
                                         "Do NOT book anything. Reply DONE when you have the flight list.")
-    for _ in range(2):                                      # find (ReAct) + one recovery if the search never worked
-        finder.invoke(ask(), cfg)
-        if any(t == "search_flights" and r["status"] == "ok" for t, _, r in LOG):
-            break
-    flights = [f for t, _, r in LOG if t == "search_flights" and r["status"] == "ok" for f in r["flights"]]
-    good = sorted((f for f in flights if C.is_ok(f)), key=lambda f: f["price"])      # select: code
-    if good:
-        booking = guarded("book_seat", {"flight": good[0]["flight"]})                # book
-        if booking["status"] == "ok":
-            guarded("pay", {"code": booking["code"]})                                # pay (needs approval)
-    # verify: is_done() is called by run()
+    searched = lambda: any(t == "search_flights" and r["status"] == "ok" for t, _, r in LOG)
+
+    def find(state, config):                                # ReAct sub-agent, read-only tool
+        finder.invoke(ask(), config)
+        return {"tries": state.get("tries", 0) + 1,
+                "flights": [f for t, _, r in LOG if t == "search_flights" and r["status"] == "ok" for f in r["flights"]]}
+
+    def select(state):                                      # code: cheapest flight that meets the constraints
+        good = sorted((f for f in state["flights"] if C.is_ok(f)), key=lambda f: f["price"])
+        return {"flight": good[0]["flight"] if good else None}
+
+    def book(state):
+        r = guarded("book_seat", {"flight": state["flight"]})
+        return {"code": r["code"] if r["status"] == "ok" else None}
+
+    def pay_(state):                                        # needs the human's approval
+        guarded("pay", {"code": state["code"]})
+        return {}
+
+    def verify(state):                                      # done is checked by code (run() checks it again)
+        return {"done": is_done()}
+
+    build({"find": find, "select": select, "book": book, "pay": pay_, "verify": verify}, {
+        "find": lambda s: "find" if not searched() and s["tries"] < 2 else "select",   # one recovery if the search never worked
+        "select": lambda s: "book" if s["flight"] else "verify",
+        "book": lambda s: "pay" if s["code"] else "verify",
+        "pay": "verify",
+        "verify": END,
+    }).invoke({}, cfg)
 
 
 # ---- 4. Hybrid + replan: LLM plans -> code runs the steps and OBSERVES each result
 #         one error  -> FIX that step right there (retry it, no model call)
 #         too many   -> a fix did not work, or the step was refused -> REPLAN (LLM sees WHY it failed)
+#         graph: search -> plan -> execute (loops) -> END, plus an edge execute -> plan (max_replan times)
 def hybrid_replan(model, cfg, max_fix=2, max_replan=2):
     planner = PLANNER | model.with_structured_output(Plan, method="function_calling")
 
@@ -270,23 +330,30 @@ def hybrid_replan(model, cfg, max_fix=2, max_replan=2):
                 break
         return result
 
-    found = act("search_flights", dict(origin=C.origin, destination=C.destination, date=C.date))
-    if found["status"] != "ok":
-        return                                              # no flight list even after the fixes -> handoff
-    flights = found["flights"]
-    for _ in range(max_replan + 1):                         # 1 plan + up to max_replan replans
-        plan = planner.invoke({"goal": C.to_prompt(), "flights": json.dumps(flights),
-                               "so_far": json.dumps([f"{t}({a}) -> {r['status']} {r.get('error') or r.get('reason') or ''}".strip()
-                                                     for t, a, r in LOG])}, cfg)    # the planner sees WHY a step failed
-        for s in plan.steps:                                # execute + observe step by step, no model call
-            code = next((r["code"] for t, _, r in reversed(LOG) if t == "book_seat" and r["status"] == "ok"), "")
-            args = {k: v for k, v in (("flight", s.flight), ("code", code if s.code == "$booking_code" else s.code)) if v}
-            if act(s.tool, args)["status"] != "ok":
-                break                                       # fix failed or step refused -> replan with the error in LOG
-        else:
-            return                                          # whole plan ran (or empty plan = no flight fits)
+    def search(state):
+        return {"flights": act("search_flights", dict(origin=C.origin, destination=C.destination, date=C.date)).get("flights")}
+
+    def plan(state, config):                                # the planner sees WHY a step failed
+        so_far = [f"{t}({a}) -> {r['status']} {r.get('error') or r.get('reason') or ''}".strip() for t, a, r in LOG]
+        p = planner.invoke({"goal": C.to_prompt(), "flights": json.dumps(state["flights"]), "so_far": json.dumps(so_far)}, config)
+        return {"steps": p.steps, "plans": state.get("plans", 0) + 1, "failed": False}
+
+    def execute(state):                                     # one step + observe, no model call
+        ok = act(state["steps"][0].tool, args_of(state["steps"][0]))["status"] == "ok"
+        return {"steps": state["steps"][1:], "failed": not ok}
+
+    def after_execute(state):
+        if not state["failed"]:
+            return "execute" if state["steps"] else END     # whole plan ran
         if any(t == "pay" and r["status"] == "denied" for t, _, r in LOG):
-            return                                          # the human said no: replanning cannot change that
+            return END                                      # the human said no: replanning cannot change that
+        return "plan" if state["plans"] <= max_replan else END   # 1 plan + up to max_replan replans
+
+    build({"search": search, "plan": plan, "execute": execute}, {
+        "search": lambda s: "plan" if s["flights"] is not None else END,    # no flight list even after the fixes -> handoff
+        "plan": lambda s: "execute" if s["steps"] else END,                 # empty plan = no flight fits
+        "execute": after_execute,
+    }).invoke({}, cfg)
 
 
 PATTERNS = {"react": react, "plan_execute": plan_execute, "hybrid": hybrid,      # the 3 required patterns

@@ -11,7 +11,7 @@ Task: build a flight-booking agent with a **harness** layer, implement **3 desig
 ## Files
 | File | Role |
 |---|---|
-| `flight_agent.py` | Everything: mock tools, harness, 3 patterns + 1 bonus, `run()`, CLI. ~330 lines. |
+| `flight_agent.py` | Everything: mock tools, harness, 3 patterns (LangGraph) + 1 bonus, `run()`, CLI. ~400 lines. |
 | `evaluate.py` | Benchmark: 15 cases (groups A-F) x 3 patterns x `--repeats`; prints summary. `--out <csv>` optional. Bonus patterns via `--patterns`. |
 | `test_harness.py` | Unit tests for the harness, no LLM needed (`pytest -q test_harness.py`). |
 | `.env` | `NINEROUTER_API_KEY` (secret, never print/commit), `NINEROUTER_URL`, `NINEROUTER_MODEL`. Git-ignored. |
@@ -24,12 +24,11 @@ Task: build a flight-booking agent with a **harness** layer, implement **3 desig
 - **Harness**: `check()` (permission, loop guard = same call 3x, `book_seat` must satisfy constraints) -> `guarded()` (runs tool, empty result = error). **All 3 patterns call tools only through `guarded()`.** For `create_agent` it is wrapped as the `harness` middleware.
 - **Done = code**: `is_done()` = exactly one paid booking, read back from `BOOKINGS`, satisfying constraints. The model's own claim is never trusted.
 - **Handoff**: `handoff()` returns `reason` (`constraints` | `payment` | `tool_error`), `done_so_far`, `tried`, `question`.
-- **Patterns**:
+- **Patterns** (all run on LangGraph; non-ReAct ones are `StateGraph`s built by `build(nodes, edges)` over a shared `State` TypedDict; nodes call tools via `guarded()`, conditional edges are code; LLM nodes take `config` so token callbacks propagate):
   - `react`: LangChain `create_agent` + harness middleware + `ModelCallLimitMiddleware(10)`.
-  - `plan_execute`: code searches first, ONE structured-output call writes the plan (`Plan`/`Step`), code executes it, no replanning. Search error -> stop + handoff (known weakness, by design).
-  - `hybrid_replan`: LLM plans once; code runs + observes each step. `error` -> retry that step in place (max 2, no LLM); still failing or `denied`/`not_found` -> replan (max 2, planner sees the error text, no re-search).
-  - `hybrid`: fixed plan in code: find (ReAct, read-only tool, 1 recovery) -> select (code, cheapest valid) -> book -> pay (approval) -> verify (`is_done`). Plan is code, not an LLM call. Known weakness: select ignores free-text `note`.
-  - `hybrid_replan` (bonus, BAOCAO Appendix A): LLM plans once; code runs + observes each step. Error -> retry in place (max 2, no LLM); still failing or `denied`/`not_found` -> replan (max 2). 100% benchmark.
+  - `plan_execute`: graph `search -> plan -> execute(loop)`. ONE structured-output call writes the plan (`Plan`/`Step`), execute runs one step per node visit, no edge back to plan. Search error -> END + handoff (known weakness, by design).
+  - `hybrid`: graph `find -> select -> book -> pay -> verify`. find = `create_agent` sub-agent (read-only tool, edge find->find for 1 recovery); select (code, cheapest valid); verify = `is_done`. Known weakness: select ignores free-text `note`.
+  - `hybrid_replan` (bonus, BAOCAO Appendix A): same graph as plan_execute + edge execute->plan. Error -> retry in place inside the node (max 2, no LLM); still failing or `denied`/`not_found` -> replan (max 2, planner sees error text, no re-search).
 - Module-level globals (`C`, `BOOKINGS`, `LOG`, `FAIL_SEARCH`, `APPROVE`) are reset by `run()`; runs must be sequential.
 
 ## Environment
@@ -45,9 +44,9 @@ A simple, B many constraints, C impossible (expect handoff `constraints`), D hum
 Success = outcome equals expected `DONE` / `FAILED:<reason>`. `handoff%` = success on the cases that must fail. `denied` = calls blocked by the harness.
 
 ## Findings (final, 15 cases x 3 reps, gemini-3.8-flash-low; numbers in BAOCAO.md)
-- ReAct 100% (9.3k tokens/run); Plan-Execute 93.3% (E1 fails 3/3: search error stops the plan; 2.4k tokens); Hybrid 93.3% (F1 fails 3/3: books VJ606 instead of QH118, `note` ignored by select; 5.8k tokens).
+- ReAct 100% (9.3k tokens/run); Plan-Execute 93.3% (E1 fails 3/3: search error stops the plan; 2.5k tokens); Hybrid 93.3% (F1 fails 3/3: books VJ606 instead of QH118, `note` ignored by select; 5.8k tokens).
 - Benchmark `denied` comes from D1 (pay refused) and loop guard in E2. No violating `book_seat` was ever attempted, so harness blocking of bad bookings is shown only by unit tests.
-- Bonus (BAOCAO Appendix A): Hybrid + Replan 100% (2.5k tokens).
+- Bonus (BAOCAO Appendix A): Hybrid + Replan 100% (2.5k tokens). Rerun after StateGraph port: same pass%/failures.
 
 ## Status
 - [x] Code, 13 unit tests pass, benchmark run3 done.
